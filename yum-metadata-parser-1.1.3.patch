@@ -1,0 +1,442 @@
+diff --git a/db.c b/db.c
+index d2b51d6..a1e4fe8 100644
+--- a/db.c
++++ b/db.c
+@@ -19,6 +19,11 @@
+ #include <unistd.h>
+ #include "db.h"
+ 
++/*  We have a lot of code so we can "quickly" update the .sqlite file using
++ * the old .sqlite data and the new .xml data. However it seems to have weird
++ * edge cases where it doesn't work, rhbz 465898 etc. ... so we turn it off. */
++#define YMP_CONFIG_UPDATE_DB 0
++
+ GQuark
+ yum_db_error_quark (void)
+ {
+@@ -196,10 +201,13 @@ yum_db_open (const char *path,
+                 return NULL;
+                 break;
+             case DB_STATUS_CHECKSUM_MISMATCH:
+-                sqlite3_exec (db, "PRAGMA synchronous = 0", NULL, NULL, NULL);
+-                sqlite3_exec (db, "DELETE FROM db_info", NULL, NULL, NULL);
+-                return db;
+-                break;
++                if (YMP_CONFIG_UPDATE_DB) {
++                    sqlite3_exec (db, "PRAGMA synchronous = 0", NULL,NULL,NULL);
++                    sqlite3_exec (db, "DELETE FROM db_info", NULL, NULL, NULL);
++                    return db;
++                    break;
++                }
++                /* FALL THROUGH */
+             case DB_STATUS_VERSION_MISMATCH:
+             case DB_STATUS_ERROR:
+                 sqlite3_close (db);
+@@ -349,24 +357,6 @@ yum_db_create_primary_tables (sqlite3 *db, GError **err)
+         return;
+     }
+ 
+-    sql = "CREATE INDEX packagename ON packages (name)";
+-    rc = sqlite3_exec (db, sql, NULL, NULL, NULL);
+-    if (rc != SQLITE_OK) {
+-        g_set_error (err, YUM_DB_ERROR, YUM_DB_ERROR,
+-                     "Can not create packagename index: %s",
+-                     sqlite3_errmsg (db));
+-        return;
+-    }
+-    
+-    sql = "CREATE INDEX packageId ON packages (pkgId)";
+-    rc = sqlite3_exec (db, sql, NULL, NULL, NULL);
+-    if (rc != SQLITE_OK) {
+-        g_set_error (err, YUM_DB_ERROR, YUM_DB_ERROR,
+-                     "Can not create packageId index: %s",
+-                     sqlite3_errmsg (db));
+-        return;
+-    }
+-
+     sql =
+         "CREATE TABLE files ("
+         "  name TEXT,"
+@@ -380,15 +370,6 @@ yum_db_create_primary_tables (sqlite3 *db, GError **err)
+         return;
+     }
+ 
+-    sql = "CREATE INDEX filenames ON files (name)";
+-    rc = sqlite3_exec (db, sql, NULL, NULL, NULL);
+-    if (rc != SQLITE_OK) {
+-        g_set_error (err, YUM_DB_ERROR, YUM_DB_ERROR,
+-                     "Can not create filenames index: %s",
+-                     sqlite3_errmsg (db));
+-        return;
+-    }
+-
+     sql =
+         "CREATE TABLE %s ("
+         "  name TEXT,"
+@@ -401,9 +382,6 @@ yum_db_create_primary_tables (sqlite3 *db, GError **err)
+     const char *deps[] = { "requires", "provides", "conflicts", "obsoletes", NULL };
+     int i;
+ 
+-    const char *pkgindexsql = "CREATE INDEX pkg%s on %s (pkgKey)";
+-    const char *nameindexsql = "CREATE INDEX %sname ON %s (name)";
+-
+     for (i = 0; deps[i]; i++) {
+         const char *prereq;
+         char *query;
+@@ -423,6 +401,68 @@ yum_db_create_primary_tables (sqlite3 *db, GError **err)
+                          deps[i], sqlite3_errmsg (db));
+             return;
+         }
++    }
++
++    sql =
++        "CREATE TRIGGER removals AFTER DELETE ON packages"
++        "  BEGIN"
++        "    DELETE FROM files WHERE pkgKey = old.pkgKey;"
++        "    DELETE FROM requires WHERE pkgKey = old.pkgKey;"
++        "    DELETE FROM provides WHERE pkgKey = old.pkgKey;"
++        "    DELETE FROM conflicts WHERE pkgKey = old.pkgKey;"
++        "    DELETE FROM obsoletes WHERE pkgKey = old.pkgKey;"
++        "  END;";
++
++    rc = sqlite3_exec (db, sql, NULL, NULL, NULL);
++    if (rc != SQLITE_OK) {
++        g_set_error (err, YUM_DB_ERROR, YUM_DB_ERROR,
++                     "Can not create removals trigger: %s",
++                     sqlite3_errmsg (db));
++        return;
++    }
++}
++
++void
++yum_db_index_primary_tables (sqlite3 *db, GError **err)
++{
++    int rc;
++    const char *sql;
++
++    sql = "CREATE INDEX IF NOT EXISTS packagename ON packages (name)";
++    rc = sqlite3_exec (db, sql, NULL, NULL, NULL);
++    if (rc != SQLITE_OK) {
++        g_set_error (err, YUM_DB_ERROR, YUM_DB_ERROR,
++                     "Can not create packagename index: %s",
++                     sqlite3_errmsg (db));
++        return;
++    }
++    
++    sql = "CREATE INDEX IF NOT EXISTS packageId ON packages (pkgId)";
++    rc = sqlite3_exec (db, sql, NULL, NULL, NULL);
++    if (rc != SQLITE_OK) {
++        g_set_error (err, YUM_DB_ERROR, YUM_DB_ERROR,
++                     "Can not create packageId index: %s",
++                     sqlite3_errmsg (db));
++        return;
++    }
++
++    sql = "CREATE INDEX IF NOT EXISTS filenames ON files (name)";
++    rc = sqlite3_exec (db, sql, NULL, NULL, NULL);
++    if (rc != SQLITE_OK) {
++        g_set_error (err, YUM_DB_ERROR, YUM_DB_ERROR,
++                     "Can not create filenames index: %s",
++                     sqlite3_errmsg (db));
++        return;
++    }
++
++    const char *deps[] = { "requires", "provides", "conflicts", "obsoletes", NULL };
++    int i;
++
++    const char *pkgindexsql = "CREATE INDEX IF NOT EXISTS pkg%s on %s (pkgKey)";
++    const char *nameindexsql = "CREATE INDEX IF NOT EXISTS %sname ON %s (name)";
++
++    for (i = 0; deps[i]; i++) {
++        char *query;
+ 
+         query = g_strdup_printf(pkgindexsql, deps[i], deps[i]);
+         rc = sqlite3_exec (db, query, NULL, NULL, NULL);
+@@ -445,25 +485,6 @@ yum_db_create_primary_tables (sqlite3 *db, GError **err)
+                 return;
+             }
+         }
+-
+-    }
+-
+-    sql =
+-        "CREATE TRIGGER removals AFTER DELETE ON packages"
+-        "  BEGIN"
+-        "    DELETE FROM files WHERE pkgKey = old.pkgKey;"
+-        "    DELETE FROM requires WHERE pkgKey = old.pkgKey;"
+-        "    DELETE FROM provides WHERE pkgKey = old.pkgKey;"
+-        "    DELETE FROM conflicts WHERE pkgKey = old.pkgKey;"
+-        "    DELETE FROM obsoletes WHERE pkgKey = old.pkgKey;"
+-        "  END;";
+-
+-    rc = sqlite3_exec (db, sql, NULL, NULL, NULL);
+-    if (rc != SQLITE_OK) {
+-        g_set_error (err, YUM_DB_ERROR, YUM_DB_ERROR,
+-                     "Can not create removals trigger: %s",
+-                     sqlite3_errmsg (db));
+-        return;
+     }
+ }
+ 
+@@ -677,43 +698,50 @@ yum_db_create_filelist_tables (sqlite3 *db, GError **err)
+         return;
+     }
+ 
+-    sql = "CREATE INDEX keyfile ON filelist (pkgKey)";
++    sql =
++        "CREATE TRIGGER remove_filelist AFTER DELETE ON packages"
++        "  BEGIN"
++        "    DELETE FROM filelist WHERE pkgKey = old.pkgKey;"
++        "  END;";
++
+     rc = sqlite3_exec (db, sql, NULL, NULL, NULL);
+     if (rc != SQLITE_OK) {
+         g_set_error (err, YUM_DB_ERROR, YUM_DB_ERROR,
+-                     "Can not create keyfile index: %s",
++                     "Can not create remove_filelist trigger: %s",
+                      sqlite3_errmsg (db));
+         return;
+     }
++}
++
++void
++yum_db_index_filelist_tables (sqlite3 *db, GError **err)
++{
++    int rc;
++    const char *sql;
+ 
+-    sql = "CREATE INDEX pkgId ON packages (pkgId)";
++    sql = "CREATE INDEX IF NOT EXISTS keyfile ON filelist (pkgKey)";
+     rc = sqlite3_exec (db, sql, NULL, NULL, NULL);
+     if (rc != SQLITE_OK) {
+         g_set_error (err, YUM_DB_ERROR, YUM_DB_ERROR,
+-                     "Can not create pkgId index: %s",
++                     "Can not create keyfile index: %s",
+                      sqlite3_errmsg (db));
+         return;
+     }
+ 
+-    sql = "CREATE INDEX dirnames ON filelist (dirname)";
++    sql = "CREATE INDEX IF NOT EXISTS pkgId ON packages (pkgId)";
+     rc = sqlite3_exec (db, sql, NULL, NULL, NULL);
+     if (rc != SQLITE_OK) {
+         g_set_error (err, YUM_DB_ERROR, YUM_DB_ERROR,
+-                     "Can not create dirnames index: %s",
++                     "Can not create pkgId index: %s",
+                      sqlite3_errmsg (db));
+         return;
+     }
+ 
+-    sql =
+-        "CREATE TRIGGER remove_filelist AFTER DELETE ON packages"
+-        "  BEGIN"
+-        "    DELETE FROM filelist WHERE pkgKey = old.pkgKey;"
+-        "  END;";
+-
++    sql = "CREATE INDEX IF NOT EXISTS dirnames ON filelist (dirname)";
+     rc = sqlite3_exec (db, sql, NULL, NULL, NULL);
+     if (rc != SQLITE_OK) {
+         g_set_error (err, YUM_DB_ERROR, YUM_DB_ERROR,
+-                     "Can not create remove_filelist trigger: %s",
++                     "Can not create dirnames index: %s",
+                      sqlite3_errmsg (db));
+         return;
+     }
+@@ -852,34 +880,41 @@ yum_db_create_other_tables (sqlite3 *db, GError **err)
+         return;
+     }
+ 
+-    sql = "CREATE INDEX keychange ON changelog (pkgKey)";
++    sql =
++        "CREATE TRIGGER remove_changelogs AFTER DELETE ON packages"
++        "  BEGIN"
++        "    DELETE FROM changelog WHERE pkgKey = old.pkgKey;"
++        "  END;";
++
+     rc = sqlite3_exec (db, sql, NULL, NULL, NULL);
+     if (rc != SQLITE_OK) {
+         g_set_error (err, YUM_DB_ERROR, YUM_DB_ERROR,
+-                     "Can not create keychange index: %s",
++                     "Can not create remove_changelogs trigger: %s",
+                      sqlite3_errmsg (db));
+         return;
+     }
++}
++
++void
++yum_db_index_other_tables (sqlite3 *db, GError **err)
++{
++    int rc;
++    const char *sql;
+ 
+-    sql = "CREATE INDEX pkgId ON packages (pkgId)";
++    sql = "CREATE INDEX IF NOT EXISTS keychange ON changelog (pkgKey)";
+     rc = sqlite3_exec (db, sql, NULL, NULL, NULL);
+     if (rc != SQLITE_OK) {
+         g_set_error (err, YUM_DB_ERROR, YUM_DB_ERROR,
+-                     "Can not create pkgId index: %s",
++                     "Can not create keychange index: %s",
+                      sqlite3_errmsg (db));
+         return;
+     }
+ 
+-    sql =
+-        "CREATE TRIGGER remove_changelogs AFTER DELETE ON packages"
+-        "  BEGIN"
+-        "    DELETE FROM changelog WHERE pkgKey = old.pkgKey;"
+-        "  END;";
+-
++    sql = "CREATE INDEX IF NOT EXISTS pkgId ON packages (pkgId)";
+     rc = sqlite3_exec (db, sql, NULL, NULL, NULL);
+     if (rc != SQLITE_OK) {
+         g_set_error (err, YUM_DB_ERROR, YUM_DB_ERROR,
+-                     "Can not create remove_changelogs trigger: %s",
++                     "Can not create pkgId index: %s",
+                      sqlite3_errmsg (db));
+         return;
+     }
+diff --git a/db.h b/db.h
+index a91d329..fce455d 100644
+--- a/db.h
++++ b/db.h
+@@ -44,6 +44,7 @@ GHashTable   *yum_db_read_package_ids       (sqlite3 *db, GError **err);
+ /* Primary */
+ 
+ void          yum_db_create_primary_tables  (sqlite3 *db, GError **err);
++void          yum_db_index_primary_tables   (sqlite3 *db, GError **err);
+ sqlite3_stmt *yum_db_package_prepare        (sqlite3 *db, GError **err);
+ void          yum_db_package_write          (sqlite3 *db,
+                                              sqlite3_stmt *handle,
+@@ -67,6 +68,7 @@ void          yum_db_file_write             (sqlite3 *db,
+ /* Filelists */
+ 
+ void          yum_db_create_filelist_tables (sqlite3 *db, GError **err);
++void          yum_db_index_filelist_tables  (sqlite3 *db, GError **err);
+ sqlite3_stmt *yum_db_package_ids_prepare    (sqlite3 *db, GError **err);
+ void          yum_db_package_ids_write      (sqlite3 *db,
+                                              sqlite3_stmt *handle,
+@@ -79,6 +81,7 @@ void          yum_db_filelists_write        (sqlite3 *db,
+ 
+ /* Other */
+ void          yum_db_create_other_tables    (sqlite3 *db, GError **err);
++void          yum_db_index_other_tables     (sqlite3 *db, GError **err);
+ sqlite3_stmt *yum_db_changelog_prepare      (sqlite3 *db, GError **err);
+ void          yum_db_changelog_write        (sqlite3 *db,
+                                              sqlite3_stmt *handle,
+diff --git a/sqlitecache.c b/sqlitecache.c
+index 749cbc1..3857be7 100644
+--- a/sqlitecache.c
++++ b/sqlitecache.c
+@@ -37,6 +37,8 @@ typedef void (*XmlParseFn)  (const char *filename,
+ 
+ typedef void (*WriteDbPackageFn) (UpdateInfo *update_info, Package *package);
+ 
++typedef void (*IndexTablesFn) (sqlite3 *db, GError **err);
++
+ struct _UpdateInfo {
+     sqlite3 *db;
+     sqlite3_stmt *remove_handle;
+@@ -55,6 +57,7 @@ struct _UpdateInfo {
+     CreateTablesFn create_tables;
+     WriteDbPackageFn write_package;
+     XmlParseFn xml_parse;
++    IndexTablesFn index_tables;
+ 
+     gpointer user_data;
+ };
+@@ -69,7 +72,7 @@ update_info_init (UpdateInfo *info, GError **err)
+     rc = sqlite3_prepare (info->db, sql, -1, &info->remove_handle, NULL);
+     if (rc != SQLITE_OK) {
+         g_set_error (err, YUM_DB_ERROR, YUM_DB_ERROR,
+-                     "Can not prepare changelog insertion: %s",
++                     "Can not prepare package removal: %s",
+                      sqlite3_errmsg (info->db));
+         sqlite3_finalize (info->remove_handle);
+         return;
+@@ -358,6 +361,11 @@ update_package_cb (Package *p, gpointer user_data)
+ {
+     UpdateInfo *update_info = (UpdateInfo *) user_data;
+ 
++    /* TODO: Wire in logging of skipped packages */
++    if (p->pkgId == NULL) {
++        return;
++    }
++
+     g_hash_table_insert (update_info->all_packages,
+                          g_string_chunk_insert (update_info->package_ids_chunk,
+                                                 p->pkgId),
+@@ -418,6 +426,10 @@ update_packages (UpdateInfo *update_info,
+         goto cleanup;
+     sqlite3_exec (update_info->db, "COMMIT", NULL, NULL, NULL);
+ 
++    update_info->index_tables (update_info->db, err);
++    if (*err)
++        goto cleanup;
++
+     update_info_remove_old_entries (update_info);
+     yum_db_dbinfo_update (update_info->db, checksum, err);
+ 
+@@ -561,6 +573,7 @@ py_update_primary (PyObject *self, PyObject *args)
+     info.update_info.create_tables = yum_db_create_primary_tables;
+     info.update_info.write_package = write_package_to_db;
+     info.update_info.xml_parse = yum_xml_parse_primary;
++    info.update_info.index_tables = yum_db_index_primary_tables;
+ 
+     return py_update (self, args, (UpdateInfo *) &info);
+ }
+@@ -576,6 +589,7 @@ py_update_filelist (PyObject *self, PyObject *args)
+     info.update_info.create_tables = yum_db_create_filelist_tables;
+     info.update_info.write_package = write_filelist_package_to_db;
+     info.update_info.xml_parse = yum_xml_parse_filelists;
++    info.update_info.index_tables = yum_db_index_filelist_tables;
+ 
+     return py_update (self, args, (UpdateInfo *) &info);
+ }
+@@ -591,6 +605,7 @@ py_update_other (PyObject *self, PyObject *args)
+     info.update_info.create_tables = yum_db_create_other_tables;
+     info.update_info.write_package = write_other_package_to_db;
+     info.update_info.xml_parse = yum_xml_parse_other;
++    info.update_info.index_tables = yum_db_index_other_tables;
+ 
+     return py_update (self, args, (UpdateInfo *) &info);
+ }
+diff --git a/sqlitecachec.py b/sqlitecachec.py
+index 85b602c..8b0ca08 100644
+--- a/sqlitecachec.py
++++ b/sqlitecachec.py
+@@ -29,8 +29,12 @@ class RepodataParserSqlite:
+         if not filename:
+             return None
+         con = sqlite.connect(filename)
++        con.text_factory = str
+         if sqlite.version_info[0] > 1:
+             con.row_factory = sqlite.Row
++        cur = con.cursor()
++        cur.execute("pragma locking_mode = EXCLUSIVE")
++        del cur
+         return con
+ 
+     def getPrimary(self, location, checksum):
+diff --git a/yum-metadata-parser.spec b/yum-metadata-parser.spec
+index 20bed79..6a5ebd4 100644
+--- a/yum-metadata-parser.spec
++++ b/yum-metadata-parser.spec
+@@ -3,7 +3,7 @@
+ Summary: A fast metadata parser for yum
+ Name: yum-metadata-parser
+ Version: 1.1.2
+-Release: 1%{?dist}
++Release: 1
+ Source0: %{name}-%{version}.tar.gz
+ License: GPL
+ Group: Development/Libraries
+@@ -40,6 +40,9 @@ Fast metadata parser for yum implemented in C.
+ %{python_sitelib_platform}/sqlitecachec.pyo
+ 
+ %changelog
++* Wed Aug 29 2007 Seth Vidal <skvidal at fedoraproject.org>
++- remove the %{dist} which doesn't really belong in the upstream pkg
++
+ * Fri Aug 24 2007 Seth Vidal <skvidal at fedoraproject.org>
+ - 1.1.2
+ 
